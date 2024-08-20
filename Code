@@ -1,0 +1,245 @@
+#include <iostream>
+#include <opencv2/opencv.hpp>
+#include <wiringPi.h>
+#include <wiringPiI2C.h>
+#include <unistd.h>
+#include <chrono>
+
+#define LCD_ADDR 0x27
+#define LCD_CHR 1
+#define LCD_CMD 0
+#define LINE1 0x80
+#define LINE2 0xC0
+#define LCD_BACKLIGHT 0x08
+#define ENABLE 0b00000100
+
+#define SENSOR_LEFT 0  // GPIO 17
+#define SENSOR_RIGHT 2 // GPIO 27
+
+using namespace cv;
+using namespace std;
+using namespace chrono;
+
+void lcd_init(int fd);  // Initialize LCD
+void lcd_byte(int fd, int bits, int mode);  // Send byte to data pins
+void lcd_toggle_enable(int fd, int bits);  // Toggle enable pin
+void lcd_display_string(int fd, const char *str, int line);  // Display string on LCD
+void type_lcd(int fd, const string& str1, const string& str2);  // Type two lines on the LCD
+void lcd_clear(int fd);  // Clear LCD screen
+
+enum State {
+    IDLE,           // No activity
+    CROSSING_IN,    // Person entering
+    CROSSING_OUT    // Person exiting
+};
+
+int main() {
+    wiringPiSetup();
+    int fd = wiringPiI2CSetup(LCD_ADDR);  // Setup I2C for LCD communication
+    if (fd == -1) {
+        cerr << "Failed to init I2C communication." << endl;
+        return 1;
+    }
+    lcd_init(fd);  // Initialize LCD
+
+    pinMode(SENSOR_LEFT, INPUT);  // Set left sensor as input
+    pinMode(SENSOR_RIGHT, INPUT);  // Set right sensor as input
+
+    VideoCapture cap(0);  // Open the default camera
+    if (!cap.isOpened()) {
+        cout << "Cannot open the webcam" << endl;
+        return -1;
+    }
+
+    Mat frame, blurred, fgMask, binary, eroded, dilated;
+    Ptr<BackgroundSubtractor> pBackSub = createBackgroundSubtractorMOG2();  // Background subtractor
+    Mat kernel = getStructuringElement(MORPH_RECT, Size(5, 5));  // Structuring element for morphological operations
+
+    int prevDiff = 0;
+    int inCount = 0, outCount = 0;
+    int cameraLeft = 0, cameraRight = 0;
+    int currentPeople = 0;  // Number of people currently in the room
+    int lefttimes = 0, righttimes = 0;
+    int leftsave = 1, rightsave = 1;
+    State currentState = IDLE;
+    steady_clock::time_point detectTime;
+
+    while (true) {
+        cap >> frame;  // Capture a frame
+        if (frame.empty()) break;
+
+        GaussianBlur(frame, blurred, Size(31, 31), 0);  // Apply Gaussian blur to the frame
+        pBackSub->apply(blurred, fgMask);  // Apply background subtraction
+        threshold(fgMask, binary, 25, 255, THRESH_BINARY);  // Convert to binary image
+        erode(binary, eroded, kernel, Point(-1, -1), 16);  // Erode the binary image
+        dilate(eroded, dilated, kernel, Point(-1, -1), 16);  // Dilate the eroded image
+
+        imshow("frame",frame);
+        imshow("binary Frame", binary);
+        imshow("dilated Frame", dilated);
+
+        vector<vector<Point>> contours;
+        findContours(dilated, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);  // Find contours
+
+        int leftCount = 0, rightCount = 0;
+        int frameCenter = frame.cols / 2;
+        for (auto& contour : contours) {
+            Rect boundingBox = boundingRect(contour);
+            if (boundingBox.area() < 20000) continue;  // Ignore small contours
+            Point center = (boundingBox.tl() + boundingBox.br()) * 0.5;  // Find center of the bounding box
+            if (center.x < frameCenter) {
+                leftCount++;
+                rectangle(frame, boundingBox, Scalar(255, 0, 0), 2);  // Draw rectangle on the left side
+            } else {
+                rightCount++;
+                rectangle(frame, boundingBox, Scalar(0, 0, 255), 2);  // Draw rectangle on the right side
+            }
+        }
+
+        if(leftsave - digitalRead(SENSOR_LEFT) == 1){
+            lefttimes ++;  // Increment left sensor counter
+        }
+        else if (rightsave - digitalRead(SENSOR_RIGHT) == 1){
+            righttimes ++;  // Increment right sensor counter
+        }
+
+        leftsave = digitalRead(SENSOR_LEFT);  // Save left sensor state
+        rightsave = digitalRead(SENSOR_RIGHT);  // Save right sensor state
+
+
+        int currDiff = leftCount - rightCount;  // Calculate the difference between left and right counts
+        int diffChange = currDiff - prevDiff;  // Calculate the change in difference
+
+        switch (currentState) {
+            case IDLE:
+                if (digitalRead(SENSOR_LEFT) == LOW) {
+                    currentState = CROSSING_IN;  // Switch to "entering" state
+                    detectTime = steady_clock::now();
+                } else if (digitalRead(SENSOR_RIGHT) == LOW) {
+                    currentState = CROSSING_OUT;  // Switch to "exiting" state
+                    detectTime = steady_clock::now();
+                }
+                break;
+
+            case CROSSING_IN:
+                if (diffChange == 2) {
+                    cameraLeft++;  // Increment camera left count
+                }
+
+                if (digitalRead(SENSOR_RIGHT) == LOW) {
+                    inCount = inCount + cameraLeft;  // Update entry count
+                    currentPeople = inCount - outCount;  // Update current people count
+                    cameraLeft = 0;
+                }
+
+                if (lefttimes == righttimes){
+                    // Update LCD display
+                    string line1 = "In: " + to_string(inCount) + " Out: " + to_string(outCount);
+                    string line2 = "people: " + to_string(currentPeople) + "   ";
+                    type_lcd(fd, line1, line2);  // Display counts on LCD
+                    cameraLeft = 0;
+                    lefttimes = 0;
+                    righttimes = 0;
+                    currentState = IDLE;  // Reset to idle state
+                }
+
+                else if (duration_cast<seconds>(steady_clock::now() - detectTime).count() > 5) {  // Timeout after 5 seconds
+                    cameraLeft = 0;
+                    lefttimes = 0;
+                    righttimes = 0;
+                    currentState = IDLE;  // Reset to idle state after timeout
+                }
+                break;
+
+            case CROSSING_OUT:
+                if (diffChange == -2) {
+                    cameraRight++;  // Increment camera right count
+                }
+
+                if (digitalRead(SENSOR_LEFT) == LOW) {
+                    outCount = outCount + cameraRight;  // Update exit count
+                    currentPeople = inCount - outCount;  // Update current people count
+                    cameraRight = 0;
+                }
+
+                if (lefttimes == righttimes){
+                    // Update LCD display
+                    string line1 = "In: " + to_string(inCount) + " Out: " + to_string(outCount);
+                    string line2 = "people: " + to_string(currentPeople) + "   ";
+                    type_lcd(fd, line1, line2);  // Display counts on LCD
+                    cameraRight = 0;
+                    lefttimes = 0;
+                    righttimes = 0;
+                    currentState = IDLE;  // Reset to idle state
+                }
+                else if (duration_cast<seconds>(steady_clock::now() - detectTime).count() > 5) {  // Timeout after 5 seconds
+                    cameraRight = 0;
+                    lefttimes = 0;
+                    righttimes = 0;
+                    currentState = IDLE;  // Reset to idle state after timeout
+                }
+                break;
+        }
+
+        prevDiff = currDiff;  // Save current difference
+
+        // Display information on the image
+        string sensorStatus = "Left: " + to_string(lefttimes) + " Right: " + to_string(righttimes);
+        putText(frame, sensorStatus, Point(10, frame.rows - 30), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 0), 1);
+        putText(frame, "Camera Left: " + to_string(leftCount) + ", Right: " + to_string(rightCount), Point(10, frame.rows - 10), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1);
+        putText(frame, "Current: " + to_string(currentPeople), Point(10, frame.rows - 50), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(255, 255, 255), 1);
+        imshow("Processed Frame", frame);  // Show processed frame
+
+        if (waitKey(30) >= 0) break;  // Exit on key press
+    }
+
+    cap.release();  // Release the camera
+    destroyAllWindows();  // Destroy all windows
+    return 0;
+}
+
+void lcd_init(int fd) {
+    lcd_byte(fd, 0x33, LCD_CMD);  // Initialize
+    lcd_byte(fd, 0x32, LCD_CMD);  // Initialize
+    lcd_byte(fd, 0x06, LCD_CMD);  // Cursor move direction
+    lcd_byte(fd, 0x0C, LCD_CMD);  // Turn cursor off
+    lcd_byte(fd, 0x28, LCD_CMD);  // 2 line display
+    lcd_byte(fd, 0x01, LCD_CMD);  // Clear display
+    usleep(500000);  // Ensure the commands have enough time to be processed
+}
+
+void lcd_byte(int fd, int bits, int mode) {
+    int bits_high = mode | (bits & 0xF0) | LCD_BACKLIGHT;
+    int bits_low = mode | ((bits << 4) & 0xF0) | LCD_BACKLIGHT;
+    wiringPiI2CReadReg8(fd, bits_high);
+    lcd_toggle_enable(fd, bits_high);
+    wiringPiI2CReadReg8(fd, bits_low);
+    lcd_toggle_enable(fd, bits_low);
+}
+
+void lcd_toggle_enable(int fd, int bits) {
+    usleep(500);  // Enable pulse must be >450ns
+    wiringPiI2CReadReg8(fd, (bits & ~ENABLE));
+    usleep(500);  // Commands need >37us to settle
+    wiringPiI2CReadReg8(fd, (bits | ENABLE));
+    usleep(500);  // Finish with another pulse
+}
+
+void lcd_display_string(int fd, const char *str, int line) {
+    lcd_byte(fd, line, LCD_CMD);
+    while (*str) {
+        lcd_byte(fd, *str++, LCD_CHR);
+    }
+}
+
+void type_lcd(int fd, const string& str1, const string& str2) {
+    lcd_clear(fd);
+    lcd_display_string(fd, str1.c_str(), LINE1);
+    lcd_display_string(fd, str2.c_str(), LINE2);
+}
+
+void lcd_clear(int fd) {
+    lcd_byte(fd, 0x01, LCD_CMD); // Clear display
+    usleep(500000);  // Ensure the command has enough time to be processed
+}
+
