@@ -30,6 +30,12 @@ Camera Module: A £14 CSI picamera V2 module was used to integrate image process
   <img src="https://github.com/user-attachments/assets/956c6b73-b95e-4619-a38f-d62d5e708898"  width="200" height="300">
 </p>
 
+LCD: Output for display data, like how many people in and out.
+
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/843ce692-495e-4e7b-b278-60dddd70e40d"  width="600" height="250">
+</p>
+
 ## System Architecture
 The system integrates infrared sensors and a camera for dual detection of people flow. The infrared sensors are responsible for detecting interruptions in the beam, while the camera, positioned overhead, processes images to handle complex scenarios, such as overlapping individuals or environmental interference. The images are processed locally on the Raspberry Pi using OpenCV, ensuring that no data is uploaded, thus maintaining privacy.
 
